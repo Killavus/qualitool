@@ -126,3 +126,32 @@
   - Test coverage: 1-hop failure propagation (sequential + parallel), 2-hop failure propagation,
     sibling branches continue after failure (sequential + parallel), check failure does not cascade,
     integration DAG with failing root and independent branches completing (sequential + parallel)
+
+### QUA-30 — qualitool-core: Effect loop & agent boundary trait
+- **Status**: Complete
+- **Branch**: feat/QUA-30-effect-loop-agent-boundary (based on feat/QUA-29-failure-propagation)
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Defined `AgentError` enum (`NoRouter`, `ExecutionFailed`) in new `agent.rs` module
+  - Defined `AgentRouter` trait with async `route(&self, request, probe_outputs) -> Result<Vec<Finding>, AgentError>`
+  - Internal `DynAgentRouter` trait for type-erased trait objects (same pattern as DynProbe/DynCheck)
+  - Added `SchedulerBuilder::set_agent_router()` — stores `Option<Arc<dyn DynAgentRouter>>` in `Scheduler`
+  - Added `NodeError::AgentCallFailed { check, source: AgentError }` variant
+  - Implemented effect loop in sequential executor (`run`): after a Check returns `CallAgent`, the scheduler
+    gathers probe outputs matching `request.include_probes`, calls the injected `AgentRouter`, and records
+    the resulting `Findings` as the check's output
+  - Implemented effect loop in parallel executor (`run_parallel`): same semantics, agent routing happens
+    inside the spawned task via standalone `route_agent_call_parallel` helper
+  - If no agent router is configured and a check emits `CallAgent`, fails with `AgentError::NoRouter`
+  - Dependency direction stays clean — `cargo tree -p qualitool-core` shows no `qualitool-agent` edge
+  - Exported `AgentError`, `AgentRouter` from `qualitool-core` public API
+  - All exit criteria verified passing:
+    - `cargo check --workspace` — passes
+    - `cargo test -p qualitool-core` — 66 tests pass (56 existing + 10 new effect loop tests)
+    - `cargo doc -p qualitool-core` — builds cleanly
+    - `cargo clippy -p qualitool-core --tests -- -D warnings` — clean
+    - `cargo tree -p qualitool-core` — no `qualitool-agent` dependency
+  - Test coverage: CallAgent routed through agent router (sequential + parallel), multiple agent checks
+    handled in sequence (sequential + parallel), no-router fails with AgentError::NoRouter (sequential +
+    parallel), agent router failure reported (sequential + parallel), agent check receives only
+    requested probes, mixed Findings and CallAgent checks coexist

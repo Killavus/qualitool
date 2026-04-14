@@ -7,9 +7,12 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use qualitool_protocol::agent::AgentRequest;
 use qualitool_protocol::check::CheckOutput;
+use qualitool_protocol::finding::Finding;
 use qualitool_protocol::manifest::{CheckManifest, ProbeManifest};
 
+use crate::agent::{AgentError, AgentRouter};
 use crate::check::{Check, CheckContext, CheckError};
 use crate::probe::{Probe, ProbeContext, ProbeError, ProbeId, ProbeOutput};
 
@@ -73,6 +76,14 @@ pub enum NodeError {
     CheckFailed {
         #[source]
         source: CheckError,
+    },
+
+    /// The check emitted `CallAgent` but the agent call failed.
+    #[error("agent call failed for check '{check}'")]
+    AgentCallFailed {
+        check: String,
+        #[source]
+        source: AgentError,
     },
 }
 
@@ -165,6 +176,24 @@ impl<T: Check> DynCheck for T {
     }
 }
 
+trait DynAgentRouter: Send + Sync {
+    fn route_dyn<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        probe_outputs: &'a HashMap<String, serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Finding>, AgentError>> + Send + 'a>>;
+}
+
+impl<T: AgentRouter> DynAgentRouter for T {
+    fn route_dyn<'a>(
+        &'a self,
+        request: &'a AgentRequest,
+        probe_outputs: &'a HashMap<String, serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Finding>, AgentError>> + Send + 'a>> {
+        Box::pin(self.route(request, probe_outputs))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SchedulerBuilder
 // ---------------------------------------------------------------------------
@@ -173,6 +202,7 @@ impl<T: Check> DynCheck for T {
 pub struct SchedulerBuilder {
     probes: Vec<Box<dyn DynProbe>>,
     checks: Vec<Box<dyn DynCheck>>,
+    agent_router: Option<Arc<dyn DynAgentRouter>>,
 }
 
 impl SchedulerBuilder {
@@ -180,6 +210,7 @@ impl SchedulerBuilder {
         Self {
             probes: Vec::new(),
             checks: Vec::new(),
+            agent_router: None,
         }
     }
 
@@ -192,6 +223,15 @@ impl SchedulerBuilder {
     /// Register a check with the scheduler.
     pub fn add_check(mut self, check: impl Check + 'static) -> Self {
         self.checks.push(Box::new(check));
+        self
+    }
+
+    /// Set the agent router for handling `CallAgent` effects from checks.
+    ///
+    /// If not set and a check emits `CallAgent`, the scheduler will record
+    /// a [`NodeError::AgentCallFailed`] with [`AgentError::NoRouter`].
+    pub fn set_agent_router(mut self, router: impl AgentRouter + 'static) -> Self {
+        self.agent_router = Some(Arc::new(router));
         self
     }
 
@@ -284,6 +324,7 @@ impl SchedulerBuilder {
             probes,
             checks,
             deps,
+            agent_router: self.agent_router,
         })
     }
 }
@@ -310,6 +351,8 @@ pub struct Scheduler {
     checks: HashMap<String, Arc<dyn DynCheck>>,
     /// Forward dependencies: node → [nodes it depends on].
     deps: HashMap<NodeId, Vec<NodeId>>,
+    /// Optional agent router for handling `CallAgent` effects.
+    agent_router: Option<Arc<dyn DynAgentRouter>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -485,6 +528,7 @@ impl Scheduler {
                             check.manifest().dependencies.clone();
                         let node_id = node.clone();
                         let name = name.clone();
+                        let agent_router = self.agent_router.clone();
 
                         in_flight.spawn(async move {
                             let _permit = sem
@@ -506,9 +550,32 @@ impl Scheduler {
                             let ctx =
                                 CheckContext::new(pr, cfg, check_probe_outputs);
                             match check.run_dyn(&ctx).await {
-                                Ok(output) => {
-                                    check_out.lock().await.push((name, output));
+                                Ok(CheckOutput::Findings { findings }) => {
+                                    check_out
+                                        .lock()
+                                        .await
+                                        .push((name, CheckOutput::Findings { findings }));
                                     NodeOutcome::Ok(node_id)
+                                }
+                                Ok(CheckOutput::CallAgent { request }) => {
+                                    let result = route_agent_call_parallel(
+                                        &name,
+                                        &request,
+                                        &probe_out,
+                                        agent_router.as_deref(),
+                                    ).await;
+                                    match result {
+                                        Ok(findings) => {
+                                            check_out
+                                                .lock()
+                                                .await
+                                                .push((name, CheckOutput::Findings { findings }));
+                                            NodeOutcome::Ok(node_id)
+                                        }
+                                        Err(error) => {
+                                            NodeOutcome::Failed(node_id, error)
+                                        }
+                                    }
                                 }
                                 Err(source) => {
                                     NodeOutcome::Failed(
@@ -649,8 +716,28 @@ impl Scheduler {
                     );
 
                     match check.run_dyn(&ctx).await {
-                        Ok(output) => {
-                            check_outputs.push((name.clone(), output));
+                        Ok(CheckOutput::Findings { findings }) => {
+                            check_outputs.push((
+                                name.clone(),
+                                CheckOutput::Findings { findings },
+                            ));
+                        }
+                        Ok(CheckOutput::CallAgent { request }) => {
+                            match self.route_agent_call(
+                                name,
+                                &request,
+                                &probe_outputs,
+                            ).await {
+                                Ok(findings) => {
+                                    check_outputs.push((
+                                        name.clone(),
+                                        CheckOutput::Findings { findings },
+                                    ));
+                                }
+                                Err(error) => {
+                                    failures.push((node.clone(), error));
+                                }
+                            }
                         }
                         Err(source) => {
                             failed_nodes.insert(node.clone());
@@ -668,6 +755,44 @@ impl Scheduler {
             check_outputs,
             failures,
         })
+    }
+
+    /// Route a `CallAgent` effect through the configured agent router.
+    ///
+    /// Gathers probe outputs matching [`AgentRequest::include_probes`] and
+    /// delegates to the router. Returns the resulting findings on success,
+    /// or a [`NodeError::AgentCallFailed`] on failure.
+    async fn route_agent_call(
+        &self,
+        check_name: &str,
+        request: &AgentRequest,
+        probe_outputs: &HashMap<ProbeId, ProbeOutput>,
+    ) -> Result<Vec<Finding>, NodeError> {
+        let router = self.agent_router.as_ref().ok_or_else(|| {
+            NodeError::AgentCallFailed {
+                check: check_name.to_string(),
+                source: AgentError::NoRouter,
+            }
+        })?;
+
+        let relevant_probes: HashMap<String, serde_json::Value> = request
+            .include_probes
+            .iter()
+            .filter_map(|name| {
+                let id = ProbeId(name.clone());
+                probe_outputs
+                    .get(&id)
+                    .map(|out| (name.clone(), out.0.clone()))
+            })
+            .collect();
+
+        router
+            .route_dyn(request, &relevant_probes)
+            .await
+            .map_err(|source| NodeError::AgentCallFailed {
+                check: check_name.to_string(),
+                source,
+            })
     }
 
     /// Returns the first failed dependency of a node, if any.
@@ -759,6 +884,39 @@ fn visit(
     state.insert(node.clone(), VisitState::Done);
     result.push(node.clone());
     Ok(())
+}
+
+/// Standalone agent routing for the parallel executor (runs inside spawned tasks).
+async fn route_agent_call_parallel(
+    check_name: &str,
+    request: &AgentRequest,
+    probe_outputs: &Arc<tokio::sync::Mutex<HashMap<ProbeId, ProbeOutput>>>,
+    router: Option<&dyn DynAgentRouter>,
+) -> Result<Vec<Finding>, NodeError> {
+    let router = router.ok_or_else(|| NodeError::AgentCallFailed {
+        check: check_name.to_string(),
+        source: AgentError::NoRouter,
+    })?;
+
+    let relevant_probes: HashMap<String, serde_json::Value> = {
+        let outputs = probe_outputs.lock().await;
+        request
+            .include_probes
+            .iter()
+            .filter_map(|name| {
+                let id = ProbeId(name.clone());
+                outputs.get(&id).map(|out| (name.clone(), out.0.clone()))
+            })
+            .collect()
+    };
+
+    router
+        .route_dyn(request, &relevant_probes)
+        .await
+        .map_err(|source| NodeError::AgentCallFailed {
+            check: check_name.to_string(),
+            source,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2016,6 +2174,334 @@ mod tests {
 
         assert_eq!(result.check_outputs.len(), 1);
         assert_eq!(result.failures.len(), 2);
+    }
+
+    // -- Agent effect loop helpers -------------------------------------------
+
+    /// A check that emits `CallAgent` instead of `Findings`.
+    struct AgentCallingCheck {
+        manifest: CheckManifest,
+        prompt: String,
+        include_probes: Vec<String>,
+    }
+
+    impl AgentCallingCheck {
+        fn new(name: &str, deps: &[&str], prompt: &str, include_probes: &[&str]) -> Self {
+            Self {
+                manifest: CheckManifest {
+                    name: name.into(),
+                    version: "0.1.0".into(),
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    dependencies: deps.iter().map(|&s| s.into()).collect(),
+                },
+                prompt: prompt.into(),
+                include_probes: include_probes.iter().map(|&s| s.into()).collect(),
+            }
+        }
+    }
+
+    impl Check for AgentCallingCheck {
+        fn manifest(&self) -> &CheckManifest {
+            &self.manifest
+        }
+
+        async fn run(&self, _ctx: &CheckContext) -> Result<CheckOutput, CheckError> {
+            Ok(CheckOutput::CallAgent {
+                request: AgentRequest {
+                    agent_hint: None,
+                    prompt: self.prompt.clone(),
+                    include_probes: self.include_probes.clone(),
+                    response_schema: serde_json::json!({"type": "object"}),
+                    constraints: qualitool_protocol::agent::AgentConstraints {
+                        max_tokens: Some(4000),
+                        timeout_seconds: Some(60),
+                        read_only: true,
+                    },
+                },
+            })
+        }
+    }
+
+    /// Test-double agent router that returns a fixed finding per call.
+    struct TestAgentRouter {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl TestAgentRouter {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let count = Arc::new(AtomicUsize::new(0));
+            (Self { call_count: Arc::clone(&count) }, count)
+        }
+    }
+
+    impl AgentRouter for TestAgentRouter {
+        async fn route(
+            &self,
+            request: &AgentRequest,
+            probe_outputs: &HashMap<String, serde_json::Value>,
+        ) -> Result<Vec<Finding>, crate::agent::AgentError> {
+            let call_num = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Finding {
+                id: FindingId(format!("agent-{call_num}")),
+                check_id: format!("agent-check-{call_num}"),
+                severity: Severity::Info,
+                title: format!("Agent finding for: {}", request.prompt),
+                summary: format!(
+                    "Agent processed {} probes",
+                    probe_outputs.len(),
+                ),
+                location: None,
+                tags: vec![],
+                payload: serde_json::json!({
+                    "probe_keys": probe_outputs.keys().collect::<Vec<_>>(),
+                }),
+            }])
+        }
+    }
+
+    /// Test-double agent router that always fails.
+    struct FailingAgentRouter;
+
+    impl AgentRouter for FailingAgentRouter {
+        async fn route(
+            &self,
+            _request: &AgentRequest,
+            _probe_outputs: &HashMap<String, serde_json::Value>,
+        ) -> Result<Vec<Finding>, crate::agent::AgentError> {
+            Err(crate::agent::AgentError::ExecutionFailed {
+                message: "agent subprocess crashed".into(),
+                source: None,
+            })
+        }
+    }
+
+    // -- Agent effect loop tests (sequential) ---------------------------------
+
+    #[tokio::test]
+    async fn call_agent_routed_through_agent_router_sequential() {
+        let (router, call_count) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"files": 42})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze this", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(result.failures.is_empty());
+        assert_eq!(result.check_outputs.len(), 1);
+
+        let (name, output) = &result.check_outputs[0];
+        assert_eq!(name, "ai-check");
+        match output {
+            CheckOutput::Findings { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert!(findings[0].title.contains("analyze this"));
+                // Verify probe data was passed through
+                let keys = findings[0].payload["probe_keys"].as_array().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "p1");
+            }
+            CheckOutput::CallAgent { .. } => panic!("expected Findings after agent routing"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_agent_checks_sequential() {
+        let (router, call_count) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"a": 1})))
+            .add_check(AgentCallingCheck::new("ai-1", &["p1"], "prompt-1", &["p1"]))
+            .add_check(AgentCallingCheck::new("ai-2", &["p1"], "prompt-2", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert!(result.failures.is_empty());
+        assert_eq!(result.check_outputs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn call_agent_without_router_fails_sequential() {
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze", &["p1"]))
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(n), NodeError::AgentCallFailed { source: AgentError::NoRouter, .. })
+            if n == "ai-check"
+        ));
+        assert!(result.check_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_router_failure_reported_sequential() {
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze", &["p1"]))
+            .set_agent_router(FailingAgentRouter)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(n), NodeError::AgentCallFailed { check, .. })
+            if n == "ai-check" && check == "ai-check"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_check_receives_only_requested_probes() {
+        let (router, _) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"a": 1})))
+            .add_probe(TestProbe::new("p2", &[], serde_json::json!({"b": 2})))
+            // Check depends on both probes but only includes p1 in agent request
+            .add_check(AgentCallingCheck::new("ai-check", &["p1", "p2"], "analyze", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert!(result.failures.is_empty());
+        let (_, output) = &result.check_outputs[0];
+        match output {
+            CheckOutput::Findings { findings } => {
+                let keys = findings[0].payload["probe_keys"].as_array().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "p1");
+            }
+            _ => panic!("expected Findings"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_findings_and_agent_checks_sequential() {
+        let (router, call_count) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"v": 1})))
+            .add_check(TestCheck::new("plain-check", &["p1"]))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(result.failures.is_empty());
+        assert_eq!(result.check_outputs.len(), 2);
+    }
+
+    // -- Agent effect loop tests (parallel) -----------------------------------
+
+    #[tokio::test]
+    async fn call_agent_routed_through_agent_router_parallel() {
+        let (router, call_count) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"files": 42})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze this", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(result.failures.is_empty());
+        assert_eq!(result.check_outputs.len(), 1);
+
+        let (name, output) = &result.check_outputs[0];
+        assert_eq!(name, "ai-check");
+        match output {
+            CheckOutput::Findings { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert!(findings[0].title.contains("analyze this"));
+            }
+            CheckOutput::CallAgent { .. } => panic!("expected Findings after agent routing"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_agent_checks_parallel() {
+        let (router, call_count) = TestAgentRouter::new();
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"a": 1})))
+            .add_check(AgentCallingCheck::new("ai-1", &["p1"], "prompt-1", &["p1"]))
+            .add_check(AgentCallingCheck::new("ai-2", &["p1"], "prompt-2", &["p1"]))
+            .set_agent_router(router)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert!(result.failures.is_empty());
+        assert_eq!(result.check_outputs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn call_agent_without_router_fails_parallel() {
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze", &["p1"]))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(n), NodeError::AgentCallFailed { source: AgentError::NoRouter, .. })
+            if n == "ai-check"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_router_failure_reported_parallel() {
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
+            .add_check(AgentCallingCheck::new("ai-check", &["p1"], "analyze", &["p1"]))
+            .set_agent_router(FailingAgentRouter)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(n), NodeError::AgentCallFailed { check, .. })
+            if n == "ai-check" && check == "ai-check"
+        ));
     }
 
     #[tokio::test]
