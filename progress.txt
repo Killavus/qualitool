@@ -102,3 +102,27 @@
   - Test coverage: max_parallelism honored (peak concurrency capped), sequential fallback (max=1),
     dependency ordering respected, shared probe cache concurrent reads, speedup over sequential,
     diamond DAG parallel branches, probe/check failure propagation, empty scheduler
+
+### QUA-29 — qualitool-core: Probe-to-Probe dependencies & failure propagation
+- **Status**: Complete
+- **Branch**: feat/QUA-29-failure-propagation (based on feat/QUA-28-parallel-executor)
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Added `NodeError` enum with `DependencyFailed { upstream: NodeId }`, `ProbeFailed`, `CheckFailed` variants
+  - Added `failures: Vec<(NodeId, NodeError)>` field to `RunResult` for per-node failure reporting
+  - Refactored `RunError` to only represent infrastructure failures (`TaskPanicked`), not node execution failures
+  - Implemented failure propagation in sequential executor (`run`): failed nodes are tracked, dependents are
+    skipped with `DependencyFailed`, independent branches continue to completion
+  - Implemented failure propagation in parallel executor (`run_parallel`): same semantics, dependency-failed
+    nodes are resolved synchronously in the ready queue without spawning tasks
+  - `DependencyFailed` reports the immediate failed upstream, not the root cause (2-hop test verifies)
+  - Check failures do not cascade — only probe failures propagate to dependents
+  - Exported `NodeError` from `qualitool-core` public API
+  - All exit criteria verified passing:
+    - `cargo check --workspace` — passes
+    - `cargo test -p qualitool-core` — 56 tests pass (48 existing updated + 8 new failure propagation tests)
+    - `cargo doc -p qualitool-core` — builds cleanly
+    - `cargo clippy -p qualitool-core --tests -- -D warnings` — clean
+  - Test coverage: 1-hop failure propagation (sequential + parallel), 2-hop failure propagation,
+    sibling branches continue after failure (sequential + parallel), check failure does not cascade,
+    integration DAG with failing root and independent branches completing (sequential + parallel)
