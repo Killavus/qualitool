@@ -1,0 +1,28 @@
+.claude/settings.local.json
+
+# Rust
+target/
+**/*.rs.bk
+
+# JavaScript / TypeScript
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.next/
+.nuxt/
+.output/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.secrets
+credentials.json
