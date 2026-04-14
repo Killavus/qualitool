@@ -38,3 +38,22 @@
     - `cargo test -p qualitool-protocol` — 26 tests pass (round-trip JSON for every wire type)
     - JSON Schema export produces valid `crates/qualitool-protocol/schema/qualitool.schema.json`
     - No dependency on other qualitool crates (bottom of the stack)
+
+### QUA-26 — qualitool-core: Probe/Check traits & context types
+- **Status**: Complete
+- **Branch**: feat/QUA-26-core-traits (based on feat/QUA-6-protocol-wire-types)
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Defined `Probe` trait with async `run(&self, ctx: &ProbeContext) -> Result<ProbeOutput, ProbeError>` and `manifest()` accessor
+  - Defined `Check` trait with async `run(&self, ctx: &CheckContext) -> Result<CheckOutput, CheckError>` and `manifest()` accessor
+  - Implemented `ProbeContext` providing: project root, resolved config, typed access to upstream probe dependency outputs
+  - Implemented `CheckContext` providing: project root, resolved config, read-only access to probe outputs
+  - Defined `ProbeId` newtype and `ProbeOutput` wrapper around `serde_json::Value`
+  - Defined `ProbeError` (ExecutionFailed, MissingDependency) and `CheckError` (ExecutionFailed, MissingProbeOutput) using thiserror
+  - Re-uses `CheckOutput`, `ProbeManifest`, `CheckManifest` from qualitool-protocol
+  - No scheduler or execution logic — traits and contexts only
+  - Rustdoc on every public item including ProbeContext/CheckContext guarantees
+  - All exit criteria verified passing:
+    - `cargo check --workspace` — passes
+    - `cargo test -p qualitool-core` — 16 tests pass (dummy Probe/Check against in-memory contexts)
+    - `cargo doc -p qualitool-core` — builds cleanly
