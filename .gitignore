@@ -7,7 +7,6 @@ target/
 # JavaScript / TypeScript
 node_modules/
 packages/*/node_modules/
-pnpm-lock.yaml
 .pnpm-store/
 dist/
 build/

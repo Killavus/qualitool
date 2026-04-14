@@ -1,0 +1,23 @@
+[package]
+name = "qualitool-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qualitool"
+path = "src/main.rs"
+
+[dependencies]
+qualitool-core = { path = "../qualitool-core" }
+qualitool-protocol = { path = "../qualitool-protocol" }
+qualitool-agent = { path = "../qualitool-agent" }
+qualitool-probes = { path = "../qualitool-probes" }
+qualitool-checks = { path = "../qualitool-checks" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
