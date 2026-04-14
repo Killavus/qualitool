@@ -21,6 +21,7 @@ thiserror = "2"
 
 # JSON Schema
 jsonschema = "0.28"
+schemars = "0.8"
 
 # TOML config
 toml = "0.8"
