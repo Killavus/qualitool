@@ -1,0 +1,1147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentConstraints": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "max_tokens": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "read_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "timeout_seconds": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "title": "AgentConstraints",
+      "type": "object"
+    },
+    "AgentRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentConstraints": {
+          "properties": {
+            "max_tokens": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "read_only": {
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_seconds": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "properties": {
+        "agent_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "constraints": {
+          "$ref": "#/definitions/AgentConstraints"
+        },
+        "include_probes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "response_schema": true
+      },
+      "required": [
+        "constraints",
+        "prompt",
+        "response_schema"
+      ],
+      "title": "AgentRequest",
+      "type": "object"
+    },
+    "CheckId": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "CheckId",
+      "type": "string"
+    },
+    "CheckManifest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "dependencies": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": true,
+        "name": {
+          "type": "string"
+        },
+        "output_schema": true,
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "CheckManifest",
+      "type": "object"
+    },
+    "CheckOutput": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentConstraints": {
+          "properties": {
+            "max_tokens": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "read_only": {
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_seconds": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "AgentRequest": {
+          "properties": {
+            "agent_hint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "constraints": {
+              "$ref": "#/definitions/AgentConstraints"
+            },
+            "include_probes": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "response_schema": true
+          },
+          "required": [
+            "constraints",
+            "prompt",
+            "response_schema"
+          ],
+          "type": "object"
+        },
+        "CodeLocation": {
+          "properties": {
+            "col_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "col_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "file": {
+              "type": "string"
+            },
+            "line_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "line_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file",
+            "line_start"
+          ],
+          "type": "object"
+        },
+        "Finding": {
+          "properties": {
+            "check_id": {
+              "type": "string"
+            },
+            "id": {
+              "$ref": "#/definitions/FindingId"
+            },
+            "location": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodeLocation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "payload": true,
+            "severity": {
+              "$ref": "#/definitions/Severity"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "tags": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "check_id",
+            "id",
+            "payload",
+            "severity",
+            "summary",
+            "title"
+          ],
+          "type": "object"
+        },
+        "FindingId": {
+          "type": "string"
+        },
+        "Severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "findings": {
+              "items": {
+                "$ref": "#/definitions/Finding"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "findings"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "findings",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/AgentRequest"
+            },
+            "type": {
+              "enum": [
+                "call_agent"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "CheckOutput"
+    },
+    "CheckRunParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "check_name": {
+          "type": "string"
+        },
+        "check_outputs": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "config": {
+          "default": null
+        },
+        "probe_outputs": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "project_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_name",
+        "project_root"
+      ],
+      "title": "CheckRunParams",
+      "type": "object"
+    },
+    "CheckRunResult": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "AgentConstraints": {
+          "properties": {
+            "max_tokens": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "read_only": {
+              "default": false,
+              "type": "boolean"
+            },
+            "timeout_seconds": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "AgentRequest": {
+          "properties": {
+            "agent_hint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "constraints": {
+              "$ref": "#/definitions/AgentConstraints"
+            },
+            "include_probes": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "response_schema": true
+          },
+          "required": [
+            "constraints",
+            "prompt",
+            "response_schema"
+          ],
+          "type": "object"
+        },
+        "CheckOutput": {
+          "oneOf": [
+            {
+              "properties": {
+                "findings": {
+                  "items": {
+                    "$ref": "#/definitions/Finding"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "enum": [
+                    "findings"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "findings",
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "request": {
+                  "$ref": "#/definitions/AgentRequest"
+                },
+                "type": {
+                  "enum": [
+                    "call_agent"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request",
+                "type"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "CodeLocation": {
+          "properties": {
+            "col_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "col_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "file": {
+              "type": "string"
+            },
+            "line_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "line_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file",
+            "line_start"
+          ],
+          "type": "object"
+        },
+        "Finding": {
+          "properties": {
+            "check_id": {
+              "type": "string"
+            },
+            "id": {
+              "$ref": "#/definitions/FindingId"
+            },
+            "location": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CodeLocation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "payload": true,
+            "severity": {
+              "$ref": "#/definitions/Severity"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "tags": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "check_id",
+            "id",
+            "payload",
+            "severity",
+            "summary",
+            "title"
+          ],
+          "type": "object"
+        },
+        "FindingId": {
+          "type": "string"
+        },
+        "Severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "check_name": {
+          "type": "string"
+        },
+        "output": {
+          "$ref": "#/definitions/CheckOutput"
+        }
+      },
+      "required": [
+        "check_name",
+        "output"
+      ],
+      "title": "CheckRunResult",
+      "type": "object"
+    },
+    "CodeLocation": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "col_end": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "col_start": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "file": {
+          "type": "string"
+        },
+        "line_end": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line_start": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file",
+        "line_start"
+      ],
+      "title": "CodeLocation",
+      "type": "object"
+    },
+    "ExtensionDescribeResult": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "CheckManifest": {
+          "properties": {
+            "dependencies": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "input_schema": true,
+            "name": {
+              "type": "string"
+            },
+            "output_schema": true,
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "version"
+          ],
+          "type": "object"
+        },
+        "ProbeManifest": {
+          "properties": {
+            "contains_source_code": {
+              "default": false,
+              "type": "boolean"
+            },
+            "dependencies": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "input_schema": true,
+            "name": {
+              "type": "string"
+            },
+            "output_schema": true,
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "version"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "checks": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/CheckManifest"
+          },
+          "type": "array"
+        },
+        "probes": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ProbeManifest"
+          },
+          "type": "array"
+        },
+        "protocol_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version"
+      ],
+      "title": "ExtensionDescribeResult",
+      "type": "object"
+    },
+    "Finding": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "CodeLocation": {
+          "properties": {
+            "col_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "col_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "file": {
+              "type": "string"
+            },
+            "line_end": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "line_start": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file",
+            "line_start"
+          ],
+          "type": "object"
+        },
+        "FindingId": {
+          "type": "string"
+        },
+        "Severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "check_id": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/definitions/FindingId"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CodeLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": true,
+        "severity": {
+          "$ref": "#/definitions/Severity"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "tags": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "id",
+        "payload",
+        "severity",
+        "summary",
+        "title"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "FindingId": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FindingId",
+      "type": "string"
+    },
+    "HostAgentCompleteParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "agent_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "check_id": {
+          "type": "string"
+        },
+        "max_tokens": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "probe_data": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "read_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "response_schema": true,
+        "timeout_seconds": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "check_id",
+        "prompt",
+        "response_schema"
+      ],
+      "title": "HostAgentCompleteParams",
+      "type": "object"
+    },
+    "HostAgentCompleteResult": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "response": true
+      },
+      "required": [
+        "response"
+      ],
+      "title": "HostAgentCompleteResult",
+      "type": "object"
+    },
+    "HostLogParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "LogLevel": {
+          "enum": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "data": true,
+        "level": {
+          "$ref": "#/definitions/LogLevel"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "message"
+      ],
+      "title": "HostLogParams",
+      "type": "object"
+    },
+    "InputMode": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "stdin-json",
+        "stdin-prompt",
+        "prompt-file",
+        "args-prompt"
+      ],
+      "title": "InputMode",
+      "type": "string"
+    },
+    "JsonRpcNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "title": "JsonRpcNotification",
+      "type": "object"
+    },
+    "JsonRpcRequest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "JsonRpcId": {
+          "anyOf": [
+            {
+              "format": "int64",
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/JsonRpcId"
+        },
+        "jsonrpc": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "id",
+        "jsonrpc",
+        "method"
+      ],
+      "title": "JsonRpcRequest",
+      "type": "object"
+    },
+    "JsonRpcResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "JsonRpcError": {
+          "properties": {
+            "code": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "data": true,
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "JsonRpcId": {
+          "anyOf": [
+            {
+              "format": "int64",
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JsonRpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "$ref": "#/definitions/JsonRpcId"
+        },
+        "jsonrpc": {
+          "type": "string"
+        },
+        "result": true
+      },
+      "required": [
+        "id",
+        "jsonrpc"
+      ],
+      "title": "JsonRpcResponse",
+      "type": "object"
+    },
+    "LogLevel": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ],
+      "title": "LogLevel",
+      "type": "string"
+    },
+    "OutputMode": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "stdout-json",
+        "stdout-json-extract"
+      ],
+      "title": "OutputMode",
+      "type": "string"
+    },
+    "ProbeManifest": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "contains_source_code": {
+          "default": false,
+          "type": "boolean"
+        },
+        "dependencies": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": true,
+        "name": {
+          "type": "string"
+        },
+        "output_schema": true,
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "ProbeManifest",
+      "type": "object"
+    },
+    "ProbeRunParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "config": {
+          "default": null
+        },
+        "dependency_outputs": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "probe_name": {
+          "type": "string"
+        },
+        "project_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "probe_name",
+        "project_root"
+      ],
+      "title": "ProbeRunParams",
+      "type": "object"
+    },
+    "ProbeRunResult": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "output": true,
+        "probe_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "output",
+        "probe_name"
+      ],
+      "title": "ProbeRunResult",
+      "type": "object"
+    },
+    "Severity": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "info",
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "title": "Severity",
+      "type": "string"
+    }
+  },
+  "description": "Wire types for the qualitool host-extension protocol",
+  "title": "Qualitool Protocol",
+  "version": "0.1.0"
+}

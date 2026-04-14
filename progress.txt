@@ -18,3 +18,23 @@
     - `just test` — passes with zero tests
     - `cargo check --workspace` — passes
     - `pnpm -r install` — succeeds
+
+### QUA-6 — qualitool-protocol: wire types and JSON-RPC schema
+- **Status**: Complete
+- **Branch**: feat/QUA-6-protocol-wire-types
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Implemented `Finding`, `FindingId`, `Severity`, `CodeLocation` wire types per ADR-0009
+  - Implemented `CheckId`, `CheckOutput` enum (`Findings` / `CallAgent`) per ADR-0010
+  - Implemented `AgentRequest`, `AgentConstraints`, `InputMode`, `OutputMode` per ADR-0010
+  - Implemented `ProbeManifest`, `CheckManifest` structs per ADR-0004
+  - Implemented JSON-RPC 2.0 envelope types (`JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcNotification`, `JsonRpcError`)
+  - Implemented method payload types: `ExtensionDescribeResult`, `ProbeRunParams`, `ProbeRunResult`, `CheckRunParams`, `CheckRunResult`, `HostLogParams`, `HostAgentCompleteParams`, `HostAgentCompleteResult`
+  - All types derive `serde::{Serialize, Deserialize}` and `schemars::JsonSchema`
+  - Added `PROTOCOL_VERSION` constant ("0.1.0")
+  - Added `schemars` workspace dependency for JSON Schema generation
+  - Created `generate-schema` binary that exports `qualitool.schema.json`
+  - All exit criteria verified passing:
+    - `cargo test -p qualitool-protocol` — 26 tests pass (round-trip JSON for every wire type)
+    - JSON Schema export produces valid `crates/qualitool-protocol/schema/qualitool.schema.json`
+    - No dependency on other qualitool crates (bottom of the stack)
