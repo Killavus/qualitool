@@ -1,0 +1,20 @@
+## Progress
+
+### QUA-5 — Monorepo skeleton: cargo workspace + pnpm workspace + justfile
+- **Status**: Complete
+- **Branch**: feat/QUA-5-monorepo-skeleton
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Created root `Cargo.toml` workspace (`members = ["crates/*"]`) with pinned workspace dependencies (serde, tokio, anyhow, thiserror, jsonschema, clap, toml, tracing)
+  - Created 7 crate stubs under `crates/`: qualitool-core, qualitool-protocol, qualitool-agent, qualitool-probes, qualitool-checks, qualitool-sdk, qualitool-cli (binary)
+  - Created `pnpm-workspace.yaml` (`packages: ["packages/*"]`)
+  - Created root `package.json` (private, prepare: husky, commitlint devDeps)
+  - Created 3 package stubs under `packages/`: web-ui, protocol-ts, sdk-ts
+  - Created `justfile` with targets: build, test, fmt, lint, codegen, run, serve, clean
+  - Updated `.gitignore` (removed pnpm-lock.yaml from ignore list)
+  - Created `presets/` directory
+  - All exit criteria verified passing:
+    - `just build` — no errors
+    - `just test` — passes with zero tests
+    - `cargo check --workspace` — passes
+    - `pnpm -r install` — succeeds
