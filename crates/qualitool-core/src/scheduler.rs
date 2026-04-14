@@ -54,31 +54,52 @@ pub enum ScheduleError {
     DuplicateNode { name: String },
 }
 
-/// Errors that occur during schedule execution.
+/// Per-node error indicating why a single node in the DAG failed.
 #[derive(Debug, thiserror::Error)]
-pub enum RunError {
-    /// A probe failed during execution.
-    #[error("probe '{name}' failed")]
+pub enum NodeError {
+    /// A dependency of this node failed, so this node was skipped.
+    #[error("dependency '{upstream}' failed; node was skipped")]
+    DependencyFailed { upstream: NodeId },
+
+    /// The probe's `run` method returned an error.
+    #[error("probe execution failed")]
     ProbeFailed {
-        name: String,
         #[source]
         source: ProbeError,
     },
 
-    /// A check failed during execution.
-    #[error("check '{name}' failed")]
+    /// The check's `run` method returned an error.
+    #[error("check execution failed")]
     CheckFailed {
-        name: String,
         #[source]
         source: CheckError,
     },
 }
 
-/// The output of a successful schedule execution.
+/// Errors that prevent the scheduler itself from completing.
+///
+/// Individual node failures are reported in [`RunResult::failures`], not here.
+/// `RunError` is reserved for infrastructure-level failures (e.g. a spawned
+/// task panicking).
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// A spawned task panicked or was cancelled.
+    #[error("task for node '{node}' panicked: {message}")]
+    TaskPanicked { node: String, message: String },
+}
+
+/// The output of a schedule execution.
+///
+/// The scheduler always runs to completion — independent DAG branches continue
+/// even when other branches fail. Successful check outputs and per-node
+/// failures are both collected here.
 #[derive(Debug)]
 pub struct RunResult {
-    /// Check outputs in execution order, keyed by check name.
+    /// Successful check outputs, keyed by check name.
     pub check_outputs: Vec<(String, CheckOutput)>,
+
+    /// Nodes that failed, either directly or because a dependency failed.
+    pub failures: Vec<(NodeId, NodeError)>,
 }
 
 /// Configuration for the parallel scheduler.
@@ -316,7 +337,8 @@ impl Scheduler {
     ///
     /// Dispatches eligible nodes (all dependencies satisfied) concurrently,
     /// bounded by a semaphore. Probe outputs are shared safely across tasks.
-    /// Returns check outputs on success, or the first node error encountered.
+    /// Independent branches continue executing even when other branches fail.
+    /// Per-node failures are collected in [`RunResult::failures`].
     /// Dropping the returned future cancels all in-flight tasks.
     pub async fn run_parallel(
         &self,
@@ -327,6 +349,7 @@ impl Scheduler {
         if self.execution_order.is_empty() {
             return Ok(RunResult {
                 check_outputs: vec![],
+                failures: vec![],
             });
         }
 
@@ -363,15 +386,46 @@ impl Scheduler {
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let semaphore = Arc::new(Semaphore::new(max_par));
 
-        let mut completed_count = 0;
+        let mut processed_count = 0;
         let total = self.execution_order.len();
+        let mut failed_nodes: HashSet<NodeId> = HashSet::new();
+        let mut failures: Vec<(NodeId, NodeError)> = Vec::new();
+
+        /// Result of a single spawned node task.
+        enum NodeOutcome {
+            Ok(NodeId),
+            Failed(NodeId, NodeError),
+        }
 
         // JoinSet owns spawned tasks; dropping it cancels in-flight work.
-        let mut in_flight: JoinSet<Result<NodeId, RunError>> = JoinSet::new();
+        let mut in_flight: JoinSet<NodeOutcome> = JoinSet::new();
 
         loop {
             // Dispatch all currently-ready nodes.
             while let Some(node) = ready.pop_front() {
+                // Check if any dependency has failed — skip immediately.
+                if let Some(failed_dep) = self.first_failed_dependency(&node, &failed_nodes) {
+                    failed_nodes.insert(node.clone());
+                    failures.push((
+                        node.clone(),
+                        NodeError::DependencyFailed {
+                            upstream: failed_dep,
+                        },
+                    ));
+                    processed_count += 1;
+                    // Promote dependents whose in-degree has reached 0.
+                    if let Some(dependents) = reverse_deps.get(&node) {
+                        for dependent in dependents {
+                            let deg = in_degree.get_mut(dependent).expect("node in graph");
+                            *deg -= 1;
+                            if *deg == 0 {
+                                ready.push_back(dependent.clone());
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let sem = Arc::clone(&semaphore);
                 let probe_out = Arc::clone(&probe_outputs);
                 let check_out = Arc::clone(&check_outputs);
@@ -406,20 +460,21 @@ impl Scheduler {
                             };
 
                             let ctx = ProbeContext::new(pr, cfg, dep_outputs);
-                            let output =
-                                probe.run_dyn(&ctx).await.map_err(|source| {
-                                    RunError::ProbeFailed {
-                                        name: name.clone(),
-                                        source,
-                                    }
-                                })?;
-
-                            probe_out
-                                .lock()
-                                .await
-                                .insert(ProbeId(name), output);
-
-                            Ok(node_id)
+                            match probe.run_dyn(&ctx).await {
+                                Ok(output) => {
+                                    probe_out
+                                        .lock()
+                                        .await
+                                        .insert(ProbeId(name), output);
+                                    NodeOutcome::Ok(node_id)
+                                }
+                                Err(source) => {
+                                    NodeOutcome::Failed(
+                                        node_id,
+                                        NodeError::ProbeFailed { source },
+                                    )
+                                }
+                            }
                         });
                     }
                     NodeId::Check(ref name) => {
@@ -450,23 +505,24 @@ impl Scheduler {
 
                             let ctx =
                                 CheckContext::new(pr, cfg, check_probe_outputs);
-                            let output =
-                                check.run_dyn(&ctx).await.map_err(|source| {
-                                    RunError::CheckFailed {
-                                        name: name.clone(),
-                                        source,
-                                    }
-                                })?;
-
-                            check_out.lock().await.push((name, output));
-
-                            Ok(node_id)
+                            match check.run_dyn(&ctx).await {
+                                Ok(output) => {
+                                    check_out.lock().await.push((name, output));
+                                    NodeOutcome::Ok(node_id)
+                                }
+                                Err(source) => {
+                                    NodeOutcome::Failed(
+                                        node_id,
+                                        NodeError::CheckFailed { source },
+                                    )
+                                }
+                            }
                         });
                     }
                 }
             }
 
-            if completed_count == total {
+            if processed_count == total {
                 break;
             }
 
@@ -474,12 +530,23 @@ impl Scheduler {
             let join_result = in_flight
                 .join_next()
                 .await
-                .expect("in_flight should not be empty when completed < total");
+                .expect("in_flight should not be empty when processed < total");
 
-            // Unwrap JoinError (panic in task) then the RunError.
-            let finished_node = join_result
-                .expect("spawned task should not panic")?;
-            completed_count += 1;
+            let outcome = join_result.map_err(|e| RunError::TaskPanicked {
+                node: "unknown".into(),
+                message: e.to_string(),
+            })?;
+
+            processed_count += 1;
+
+            let finished_node = match outcome {
+                NodeOutcome::Ok(node_id) => node_id,
+                NodeOutcome::Failed(node_id, error) => {
+                    failed_nodes.insert(node_id.clone());
+                    failures.push((node_id.clone(), error));
+                    node_id
+                }
+            };
 
             // Decrement in-degree for dependents of the finished node.
             if let Some(dependents) = reverse_deps.get(&finished_node) {
@@ -497,14 +564,18 @@ impl Scheduler {
             .expect("all tasks completed")
             .into_inner();
 
-        Ok(RunResult { check_outputs })
+        Ok(RunResult {
+            check_outputs,
+            failures,
+        })
     }
 
     /// Execute all nodes sequentially in topological order.
     ///
     /// Probe outputs are memoized and injected into downstream contexts
-    /// automatically. Returns the collected check outputs on success, or
-    /// the first node error encountered.
+    /// automatically. Independent branches continue executing even when
+    /// other branches fail. Per-node failures are collected in
+    /// [`RunResult::failures`].
     pub async fn run(
         &self,
         project_root: PathBuf,
@@ -512,8 +583,22 @@ impl Scheduler {
     ) -> Result<RunResult, RunError> {
         let mut probe_outputs: HashMap<ProbeId, ProbeOutput> = HashMap::new();
         let mut check_outputs: Vec<(String, CheckOutput)> = Vec::new();
+        let mut failures: Vec<(NodeId, NodeError)> = Vec::new();
+        let mut failed_nodes: HashSet<NodeId> = HashSet::new();
 
         for node in &self.execution_order {
+            // Check if any dependency has failed — if so, skip this node.
+            if let Some(failed_dep) = self.first_failed_dependency(node, &failed_nodes) {
+                failed_nodes.insert(node.clone());
+                failures.push((
+                    node.clone(),
+                    NodeError::DependencyFailed {
+                        upstream: failed_dep,
+                    },
+                ));
+                continue;
+            }
+
             match node {
                 NodeId::Probe(name) => {
                     let probe = self.probes.get(name).expect("validated in build");
@@ -531,16 +616,18 @@ impl Scheduler {
                     let ctx =
                         ProbeContext::new(project_root.clone(), config.clone(), dep_outputs);
 
-                    let output =
-                        probe
-                            .run_dyn(&ctx)
-                            .await
-                            .map_err(|source| RunError::ProbeFailed {
-                                name: name.clone(),
-                                source,
-                            })?;
-
-                    probe_outputs.insert(ProbeId(name.clone()), output);
+                    match probe.run_dyn(&ctx).await {
+                        Ok(output) => {
+                            probe_outputs.insert(ProbeId(name.clone()), output);
+                        }
+                        Err(source) => {
+                            failed_nodes.insert(node.clone());
+                            failures.push((
+                                node.clone(),
+                                NodeError::ProbeFailed { source },
+                            ));
+                        }
+                    }
                 }
                 NodeId::Check(name) => {
                     let check = self.checks.get(name).expect("validated in build");
@@ -561,21 +648,39 @@ impl Scheduler {
                         check_probe_outputs,
                     );
 
-                    let output =
-                        check
-                            .run_dyn(&ctx)
-                            .await
-                            .map_err(|source| RunError::CheckFailed {
-                                name: name.clone(),
-                                source,
-                            })?;
-
-                    check_outputs.push((name.clone(), output));
+                    match check.run_dyn(&ctx).await {
+                        Ok(output) => {
+                            check_outputs.push((name.clone(), output));
+                        }
+                        Err(source) => {
+                            failed_nodes.insert(node.clone());
+                            failures.push((
+                                node.clone(),
+                                NodeError::CheckFailed { source },
+                            ));
+                        }
+                    }
                 }
             }
         }
 
-        Ok(RunResult { check_outputs })
+        Ok(RunResult {
+            check_outputs,
+            failures,
+        })
+    }
+
+    /// Returns the first failed dependency of a node, if any.
+    fn first_failed_dependency(
+        &self,
+        node: &NodeId,
+        failed_nodes: &HashSet<NodeId>,
+    ) -> Option<NodeId> {
+        self.deps
+            .get(node)?
+            .iter()
+            .find(|dep| failed_nodes.contains(dep))
+            .cloned()
     }
 }
 
@@ -1139,6 +1244,7 @@ mod tests {
         let scheduler = Scheduler::builder().build().unwrap();
         let result = scheduler.run(project_root(), empty_config()).await.unwrap();
         assert!(result.check_outputs.is_empty());
+        assert!(result.failures.is_empty());
     }
 
     #[tokio::test]
@@ -1197,31 +1303,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_failure_propagates_as_run_error() {
+    async fn probe_failure_reported_in_result() {
         let scheduler = Scheduler::builder()
             .add_probe(FailingProbe::new("bad"))
             .build()
             .unwrap();
 
-        let err = scheduler.run(project_root(), empty_config()).await.unwrap_err();
-        match err {
-            RunError::ProbeFailed { name, .. } => assert_eq!(name, "bad"),
-            other => panic!("expected ProbeFailed, got: {other}"),
-        }
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Probe(name), NodeError::ProbeFailed { .. }) if name == "bad"
+        ));
     }
 
     #[tokio::test]
-    async fn check_failure_propagates_as_run_error() {
+    async fn check_failure_reported_in_result() {
         let scheduler = Scheduler::builder()
             .add_check(FailingCheck::new("bad"))
             .build()
             .unwrap();
 
-        let err = scheduler.run(project_root(), empty_config()).await.unwrap_err();
-        match err {
-            RunError::CheckFailed { name, .. } => assert_eq!(name, "bad"),
-            other => panic!("expected CheckFailed, got: {other}"),
-        }
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(name), NodeError::CheckFailed { .. }) if name == "bad"
+        ));
     }
 
     // -- Integration: 3-probe, 5-check DAG ----------------------------------
@@ -1547,7 +1655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_run_probe_failure_stops_execution() {
+    async fn parallel_run_probe_failure_reported_in_result() {
         let tracker = Arc::new(ConcurrencyTracker::new());
         let delay = Duration::from_millis(30);
 
@@ -1559,16 +1667,19 @@ mod tests {
             .unwrap();
 
         let config = SchedulerConfig { max_parallelism: 4 };
-        let err = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap_err();
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
 
-        match err {
-            RunError::ProbeFailed { name, .. } => assert_eq!(name, "bad"),
-            other => panic!("expected ProbeFailed, got: {other}"),
-        }
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Probe(name), NodeError::ProbeFailed { .. }) if name == "bad"
+        ));
+        // The independent branch (good → c1) should still succeed.
+        assert_eq!(result.check_outputs.len(), 1);
     }
 
     #[tokio::test]
-    async fn parallel_run_check_failure_stops_execution() {
+    async fn parallel_run_check_failure_reported_in_result() {
         let scheduler = Scheduler::builder()
             .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
             .add_check(FailingCheck::new("bad"))
@@ -1576,12 +1687,13 @@ mod tests {
             .unwrap();
 
         let config = SchedulerConfig { max_parallelism: 4 };
-        let err = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap_err();
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
 
-        match err {
-            RunError::CheckFailed { name, .. } => assert_eq!(name, "bad"),
-            other => panic!("expected CheckFailed, got: {other}"),
-        }
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(
+            &result.failures[0],
+            (NodeId::Check(name), NodeError::CheckFailed { .. }) if name == "bad"
+        ));
     }
 
     #[tokio::test]
@@ -1612,6 +1724,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(result.check_outputs.len(), 1);
+        assert!(result.failures.is_empty());
         // p-left and p-right should run in parallel after p-root.
         // Total: ~100ms (50ms for root + 50ms for parallel left/right), not 150ms.
         assert!(
@@ -1619,5 +1732,329 @@ mod tests {
             "diamond DAG took {:?}, expected under 130ms (parallel branches)",
             elapsed,
         );
+    }
+
+    // -- Failure propagation tests (QUA-29) -----------------------------------
+
+    /// A probe that records whether it was actually executed.
+    struct TrackedProbe {
+        manifest: ProbeManifest,
+        output: serde_json::Value,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TrackedProbe {
+        fn new(name: &str, deps: &[&str], output: serde_json::Value) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+            let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    manifest: ProbeManifest {
+                        name: name.into(),
+                        version: "0.1.0".into(),
+                        description: None,
+                        input_schema: None,
+                        output_schema: None,
+                        dependencies: deps.iter().map(|&s| s.into()).collect(),
+                        contains_source_code: false,
+                    },
+                    output,
+                    executed: Arc::clone(&executed),
+                },
+                executed,
+            )
+        }
+    }
+
+    impl Probe for TrackedProbe {
+        fn manifest(&self) -> &ProbeManifest {
+            &self.manifest
+        }
+
+        async fn run(&self, _ctx: &ProbeContext) -> Result<ProbeOutput, ProbeError> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(ProbeOutput(self.output.clone()))
+        }
+    }
+
+    /// A check that records whether it was actually executed.
+    struct TrackedCheck {
+        manifest: CheckManifest,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TrackedCheck {
+        fn new(name: &str, deps: &[&str]) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+            let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    manifest: CheckManifest {
+                        name: name.into(),
+                        version: "0.1.0".into(),
+                        description: None,
+                        input_schema: None,
+                        output_schema: None,
+                        dependencies: deps.iter().map(|&s| s.into()).collect(),
+                    },
+                    executed: Arc::clone(&executed),
+                },
+                executed,
+            )
+        }
+    }
+
+    impl Check for TrackedCheck {
+        fn manifest(&self) -> &CheckManifest {
+            &self.manifest
+        }
+
+        async fn run(&self, _ctx: &CheckContext) -> Result<CheckOutput, CheckError> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(CheckOutput::Findings { findings: vec![] })
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_propagation_one_hop_sequential() {
+        // p-bad (fails) → p-child (depends on p-bad) → c1 (depends on p-child)
+        // p-child and c1 should get DependencyFailed, not execute.
+        let (p_child, child_ran) = TrackedProbe::new("p-child", &["p-bad"], serde_json::json!({}));
+        let (c1, c1_ran) = TrackedCheck::new("c1", &["p-child"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-bad"))
+            .add_probe(p_child)
+            .add_check(c1)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert!(!child_ran.load(Ordering::SeqCst), "p-child should not have executed");
+        assert!(!c1_ran.load(Ordering::SeqCst), "c1 should not have executed");
+        assert!(result.check_outputs.is_empty());
+
+        // p-bad: ProbeFailed, p-child: DependencyFailed(p-bad), c1: DependencyFailed(p-child)
+        assert_eq!(result.failures.len(), 3);
+
+        let bad_failure = result.failures.iter().find(|(id, _)| *id == NodeId::Probe("p-bad".into()));
+        assert!(matches!(bad_failure, Some((_, NodeError::ProbeFailed { .. }))));
+
+        let child_failure = result.failures.iter().find(|(id, _)| *id == NodeId::Probe("p-child".into()));
+        assert!(matches!(child_failure, Some((_, NodeError::DependencyFailed { upstream })) if *upstream == NodeId::Probe("p-bad".into())));
+
+        let c1_failure = result.failures.iter().find(|(id, _)| *id == NodeId::Check("c1".into()));
+        assert!(matches!(c1_failure, Some((_, NodeError::DependencyFailed { upstream })) if *upstream == NodeId::Probe("p-child".into())));
+    }
+
+    #[tokio::test]
+    async fn failure_propagation_two_hops_sequential() {
+        // p-root (fails) → p-mid → p-leaf
+        // Both p-mid and p-leaf get DependencyFailed.
+        let (p_mid, mid_ran) = TrackedProbe::new("p-mid", &["p-root"], serde_json::json!({}));
+        let (p_leaf, leaf_ran) = TrackedProbe::new("p-leaf", &["p-mid"], serde_json::json!({}));
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-root"))
+            .add_probe(p_mid)
+            .add_probe(p_leaf)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert!(!mid_ran.load(Ordering::SeqCst));
+        assert!(!leaf_ran.load(Ordering::SeqCst));
+        assert_eq!(result.failures.len(), 3);
+
+        // p-leaf should report p-mid as its failed upstream (not p-root).
+        let leaf_failure = result.failures.iter().find(|(id, _)| *id == NodeId::Probe("p-leaf".into()));
+        assert!(matches!(leaf_failure, Some((_, NodeError::DependencyFailed { upstream })) if *upstream == NodeId::Probe("p-mid".into())));
+    }
+
+    #[tokio::test]
+    async fn sibling_branches_continue_after_failure_sequential() {
+        // Two independent branches:
+        //   Branch A: p-bad (fails) → c-a (skipped)
+        //   Branch B: p-good (succeeds) → c-b (succeeds)
+        // Branch B must complete despite Branch A failing.
+        let (p_good, good_ran) = TrackedProbe::new("p-good", &[], serde_json::json!({"v": 1}));
+        let (c_b, cb_ran) = TrackedCheck::new("c-b", &["p-good"]);
+        let (c_a, ca_ran) = TrackedCheck::new("c-a", &["p-bad"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-bad"))
+            .add_probe(p_good)
+            .add_check(c_a)
+            .add_check(c_b)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert!(good_ran.load(Ordering::SeqCst), "p-good should have run");
+        assert!(cb_ran.load(Ordering::SeqCst), "c-b should have run");
+        assert!(!ca_ran.load(Ordering::SeqCst), "c-a should not have run");
+
+        assert_eq!(result.check_outputs.len(), 1);
+        assert_eq!(result.check_outputs[0].0, "c-b");
+
+        // Failures: p-bad (ProbeFailed) + c-a (DependencyFailed)
+        assert_eq!(result.failures.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn integration_failing_root_unrelated_branch_completes_sequential() {
+        // Complex DAG:
+        //   Branch A: p-fail (fails) → p-derived (skipped) → c-derived (skipped)
+        //   Branch B: p-ok1 → c-ok1 (succeeds)
+        //   Branch C: p-ok2 → p-ok3 (depends on p-ok2) → c-ok2 (depends on p-ok3)
+        let (p_derived, derived_ran) = TrackedProbe::new("p-derived", &["p-fail"], serde_json::json!({}));
+        let (c_derived, c_derived_ran) = TrackedCheck::new("c-derived", &["p-derived"]);
+
+        let (p_ok1, ok1_ran) = TrackedProbe::new("p-ok1", &[], serde_json::json!({"v": 1}));
+        let (c_ok1, c_ok1_ran) = TrackedCheck::new("c-ok1", &["p-ok1"]);
+
+        let (p_ok2, ok2_ran) = TrackedProbe::new("p-ok2", &[], serde_json::json!({"value": 10}));
+        let (p_ok3, ok3_ran) = TrackedProbe::new("p-ok3", &["p-ok2"], serde_json::json!({"value": 20}));
+        let (c_ok2, c_ok2_ran) = TrackedCheck::new("c-ok2", &["p-ok3"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-fail"))
+            .add_probe(p_derived)
+            .add_check(c_derived)
+            .add_probe(p_ok1)
+            .add_check(c_ok1)
+            .add_probe(p_ok2)
+            .add_probe(p_ok3)
+            .add_check(c_ok2)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        // Failed branch
+        assert!(!derived_ran.load(Ordering::SeqCst));
+        assert!(!c_derived_ran.load(Ordering::SeqCst));
+
+        // Successful branches
+        assert!(ok1_ran.load(Ordering::SeqCst));
+        assert!(c_ok1_ran.load(Ordering::SeqCst));
+        assert!(ok2_ran.load(Ordering::SeqCst));
+        assert!(ok3_ran.load(Ordering::SeqCst));
+        assert!(c_ok2_ran.load(Ordering::SeqCst));
+
+        assert_eq!(result.check_outputs.len(), 2);
+        // Failures: p-fail + p-derived + c-derived = 3
+        assert_eq!(result.failures.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn check_failure_does_not_cascade() {
+        // A failing check should not affect other checks.
+        // p1 → c-bad (fails), c-good (both depend on p1)
+        let (c_good, c_good_ran) = TrackedCheck::new("c-good", &["p1"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({"v": 1})))
+            .add_check(FailingCheck::new("c-bad"))
+            .add_check(c_good)
+            .build()
+            .unwrap();
+
+        let result = scheduler.run(project_root(), empty_config()).await.unwrap();
+
+        assert!(c_good_ran.load(Ordering::SeqCst));
+        assert_eq!(result.check_outputs.len(), 1);
+        assert_eq!(result.check_outputs[0].0, "c-good");
+
+        assert_eq!(result.failures.len(), 1);
+        assert!(matches!(&result.failures[0], (NodeId::Check(n), NodeError::CheckFailed { .. }) if n == "c-bad"));
+    }
+
+    // -- Parallel failure propagation tests -----------------------------------
+
+    #[tokio::test]
+    async fn failure_propagation_one_hop_parallel() {
+        let (p_child, child_ran) = TrackedProbe::new("p-child", &["p-bad"], serde_json::json!({}));
+        let (c1, c1_ran) = TrackedCheck::new("c1", &["p-child"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-bad"))
+            .add_probe(p_child)
+            .add_check(c1)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert!(!child_ran.load(Ordering::SeqCst));
+        assert!(!c1_ran.load(Ordering::SeqCst));
+        assert_eq!(result.failures.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sibling_branches_continue_after_failure_parallel() {
+        let (p_good, good_ran) = TrackedProbe::new("p-good", &[], serde_json::json!({"v": 1}));
+        let (c_b, cb_ran) = TrackedCheck::new("c-b", &["p-good"]);
+        let (c_a, ca_ran) = TrackedCheck::new("c-a", &["p-bad"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-bad"))
+            .add_probe(p_good)
+            .add_check(c_a)
+            .add_check(c_b)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert!(good_ran.load(Ordering::SeqCst));
+        assert!(cb_ran.load(Ordering::SeqCst));
+        assert!(!ca_ran.load(Ordering::SeqCst));
+
+        assert_eq!(result.check_outputs.len(), 1);
+        assert_eq!(result.failures.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn integration_failing_root_unrelated_branch_completes_parallel() {
+        let (p_derived, derived_ran) = TrackedProbe::new("p-derived", &["p-fail"], serde_json::json!({}));
+        let (c_derived, c_derived_ran) = TrackedCheck::new("c-derived", &["p-derived"]);
+
+        let (p_ok1, ok1_ran) = TrackedProbe::new("p-ok1", &[], serde_json::json!({"v": 1}));
+        let (c_ok1, c_ok1_ran) = TrackedCheck::new("c-ok1", &["p-ok1"]);
+
+        let (p_ok2, ok2_ran) = TrackedProbe::new("p-ok2", &[], serde_json::json!({"value": 10}));
+        let (p_ok3, ok3_ran) = TrackedProbe::new("p-ok3", &["p-ok2"], serde_json::json!({"value": 20}));
+        let (c_ok2, c_ok2_ran) = TrackedCheck::new("c-ok2", &["p-ok3"]);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("p-fail"))
+            .add_probe(p_derived)
+            .add_check(c_derived)
+            .add_probe(p_ok1)
+            .add_check(c_ok1)
+            .add_probe(p_ok2)
+            .add_probe(p_ok3)
+            .add_check(c_ok2)
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert!(!derived_ran.load(Ordering::SeqCst));
+        assert!(!c_derived_ran.load(Ordering::SeqCst));
+
+        assert!(ok1_ran.load(Ordering::SeqCst));
+        assert!(c_ok1_ran.load(Ordering::SeqCst));
+        assert!(ok2_ran.load(Ordering::SeqCst));
+        assert!(ok3_ran.load(Ordering::SeqCst));
+        assert!(c_ok2_ran.load(Ordering::SeqCst));
+
+        assert_eq!(result.check_outputs.len(), 2);
+        assert_eq!(result.failures.len(), 3);
     }
 }
