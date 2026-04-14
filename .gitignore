@@ -6,12 +6,25 @@ target/
 
 # JavaScript / TypeScript
 node_modules/
+packages/*/node_modules/
+pnpm-lock.yaml
+.pnpm-store/
 dist/
 build/
 *.tsbuildinfo
 .next/
 .nuxt/
 .output/
+
+# Editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Qualitool runtime cache
+.qualitool/cache/
 
 # Environment variables & secrets
 .env
