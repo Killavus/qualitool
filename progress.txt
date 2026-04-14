@@ -57,3 +57,26 @@
     - `cargo check --workspace` — passes
     - `cargo test -p qualitool-core` — 16 tests pass (dummy Probe/Check against in-memory contexts)
     - `cargo doc -p qualitool-core` — builds cleanly
+
+### QUA-27 — qualitool-core: DAG scheduler with topological sort & cycle detection
+- **Status**: Complete
+- **Branch**: feat/QUA-27-dag-scheduler (based on feat/QUA-26-core-traits)
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Implemented `NodeId` enum (Probe/Check) with derived `Ord` for deterministic ordering (probes before checks)
+  - Implemented `ScheduleError` with `Cycle`, `UnknownDependency`, `DuplicateNode` variants
+  - Implemented `RunError` with `ProbeFailed`, `CheckFailed` variants wrapping source errors
+  - Implemented `SchedulerBuilder` with fluent `add_probe`/`add_check` API and `build()` validation
+  - `build()` validates: no duplicate names, all dependencies exist, no cycles (DFS-based topo sort)
+  - DFS topological sort with sorted node/adjacency iteration for deterministic ordering under ties
+  - Cycle detection reports the full cycle path (e.g., `probe:A -> probe:B -> probe:C -> probe:A`)
+  - Implemented `Scheduler::run()` — sequential executor with probe output memoization
+  - Probe outputs collected during execution are injected into downstream ProbeContext/CheckContext
+  - Type-erased Probe/Check trait objects via internal DynProbe/DynCheck traits (boxes RPITIT futures)
+  - All exit criteria verified passing:
+    - `cargo check --workspace` — passes
+    - `cargo test -p qualitool-core` — 37 tests pass (16 existing + 21 scheduler tests)
+    - `cargo doc -p qualitool-core` — builds cleanly
+  - Test coverage: topo sort correctness, direct/transitive/self cycles, deterministic ordering,
+    unknown dependencies, duplicate nodes, probe output memoization, check receives probe outputs,
+    probe/check failure propagation, 3-probe 5-check integration DAG
