@@ -12,3 +12,17 @@
     - Required `Project` trailer
   - Added `test-commitlint.sh` exercising all 7 acceptance criteria
   - All acceptance criteria verified passing
+
+### QUA-24 — git commit-msg hook blocks non-compliant commits at commit time
+- **Status**: Complete
+- **Branch**: feat/QUA-24-commit-msg-hook
+- **Project**: DevExperience
+- **What was done**:
+  - Created `.husky/commit-msg` hook running `npx --no -- commitlint --edit "$1"`
+  - `package.json` `prepare` script already wires `husky` (from QUA-22)
+  - Added `test-commit-msg-hook.sh` exercising all 4 acceptance criteria
+  - All acceptance criteria verified passing:
+    - AC1: `.husky/commit-msg` exists
+    - AC2: Missing scope rejected, no commit created
+    - AC3: Missing Project footer rejected, no commit created
+    - AC4: Valid message accepted, commit created
