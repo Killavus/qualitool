@@ -1,0 +1,14 @@
+## Progress
+
+### QUA-22 — Commitlint rejects non-compliant commits and accepts valid Linear-format ones
+- **Status**: Complete
+- **Branch**: feat/QUA-22-commitlint-config
+- **Project**: DevExperience
+- **What was done**:
+  - Created root `package.json` (private, devDeps: @commitlint/cli ^19, @commitlint/config-conventional ^19, husky ^9)
+  - Created `commitlint.config.js` enforcing:
+    - Required scope matching Linear issue ID pattern (e.g. QUA-123)
+    - Conventional commit types plus `bugfix`
+    - Required `Project` trailer
+  - Added `test-commitlint.sh` exercising all 7 acceptance criteria
+  - All acceptance criteria verified passing
