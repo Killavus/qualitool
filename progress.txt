@@ -80,3 +80,25 @@
   - Test coverage: topo sort correctness, direct/transitive/self cycles, deterministic ordering,
     unknown dependencies, duplicate nodes, probe output memoization, check receives probe outputs,
     probe/check failure propagation, 3-probe 5-check integration DAG
+
+### QUA-28 — qualitool-core: Parallel executor with max_parallelism
+- **Status**: Complete
+- **Branch**: feat/QUA-28-parallel-executor (based on feat/QUA-27-dag-scheduler)
+- **Project**: Architecture bootstrap — v1 skeleton
+- **What was done**:
+  - Implemented `SchedulerConfig` with `max_parallelism` field (default: `available_parallelism - 1`, minimum 1)
+  - Implemented `Scheduler::run_parallel()` — bounded-concurrency executor using wave-front algorithm
+  - Wave-front algorithm: in-degree tracking, reverse-dep map, ready queue dispatch
+  - Concurrency bounded by `tokio::sync::Semaphore` to honor `max_parallelism`
+  - Spawned tasks via `tokio::task::JoinSet` — dropping the future cancels in-flight tasks (graceful shutdown)
+  - Probe outputs shared via `Arc<tokio::sync::Mutex<HashMap>>` for safe concurrent reads
+  - Internal storage changed from `Box<dyn DynProbe/DynCheck>` to `Arc<dyn DynProbe/DynCheck>` for `'static` spawning
+  - Preserved existing sequential `Scheduler::run()` path unchanged
+  - All exit criteria verified passing:
+    - `cargo check --workspace` — passes
+    - `cargo test -p qualitool-core` — 48 tests pass (37 existing + 11 parallel executor tests)
+    - `cargo doc -p qualitool-core` — builds cleanly
+    - `cargo clippy -p qualitool-core --tests -- -D warnings` — clean
+  - Test coverage: max_parallelism honored (peak concurrency capped), sequential fallback (max=1),
+    dependency ordering respected, shared probe cache concurrent reads, speedup over sequential,
+    diamond DAG parallel branches, probe/check failure propagation, empty scheduler
