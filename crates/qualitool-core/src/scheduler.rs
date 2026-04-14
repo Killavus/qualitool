@@ -1,7 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use qualitool_protocol::check::CheckOutput;
 use qualitool_protocol::manifest::{CheckManifest, ProbeManifest};
@@ -75,6 +79,25 @@ pub enum RunError {
 pub struct RunResult {
     /// Check outputs in execution order, keyed by check name.
     pub check_outputs: Vec<(String, CheckOutput)>,
+}
+
+/// Configuration for the parallel scheduler.
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    /// Maximum number of nodes to execute concurrently.
+    /// Defaults to `num_cpus - 1` (minimum 1).
+    pub max_parallelism: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        Self {
+            max_parallelism: cpus.saturating_sub(1).max(1),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,21 +241,28 @@ impl SchedulerBuilder {
         let nodes: Vec<NodeId> = all_nodes.into_iter().collect();
         let execution_order = topological_sort(&nodes, &deps)?;
 
-        let probes: HashMap<String, Box<dyn DynProbe>> = self
+        let probes: HashMap<String, Arc<dyn DynProbe>> = self
             .probes
             .into_iter()
-            .map(|p| (p.manifest().name.clone(), p))
+            .map(|p| {
+                let name = p.manifest().name.clone();
+                (name, Arc::from(p) as Arc<dyn DynProbe>)
+            })
             .collect();
-        let checks: HashMap<String, Box<dyn DynCheck>> = self
+        let checks: HashMap<String, Arc<dyn DynCheck>> = self
             .checks
             .into_iter()
-            .map(|c| (c.manifest().name.clone(), c))
+            .map(|c| {
+                let name = c.manifest().name.clone();
+                (name, Arc::from(c) as Arc<dyn DynCheck>)
+            })
             .collect();
 
         Ok(Scheduler {
             execution_order,
             probes,
             checks,
+            deps,
         })
     }
 }
@@ -251,11 +281,14 @@ impl Default for SchedulerBuilder {
 ///
 /// Built via [`SchedulerBuilder`] which performs dependency validation and
 /// cycle detection at construction time. Call [`run`](Scheduler::run) to
-/// execute all nodes sequentially in dependency order.
+/// execute all nodes sequentially in dependency order, or
+/// [`run_parallel`](Scheduler::run_parallel) for bounded-concurrency execution.
 pub struct Scheduler {
     execution_order: Vec<NodeId>,
-    probes: HashMap<String, Box<dyn DynProbe>>,
-    checks: HashMap<String, Box<dyn DynCheck>>,
+    probes: HashMap<String, Arc<dyn DynProbe>>,
+    checks: HashMap<String, Arc<dyn DynCheck>>,
+    /// Forward dependencies: node → [nodes it depends on].
+    deps: HashMap<NodeId, Vec<NodeId>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -277,6 +310,194 @@ impl Scheduler {
     /// The deterministic execution order produced by topological sort.
     pub fn execution_order(&self) -> &[NodeId] {
         &self.execution_order
+    }
+
+    /// Execute nodes in parallel up to `config.max_parallelism`.
+    ///
+    /// Dispatches eligible nodes (all dependencies satisfied) concurrently,
+    /// bounded by a semaphore. Probe outputs are shared safely across tasks.
+    /// Returns check outputs on success, or the first node error encountered.
+    /// Dropping the returned future cancels all in-flight tasks.
+    pub async fn run_parallel(
+        &self,
+        project_root: PathBuf,
+        config: serde_json::Value,
+        scheduler_config: &SchedulerConfig,
+    ) -> Result<RunResult, RunError> {
+        if self.execution_order.is_empty() {
+            return Ok(RunResult {
+                check_outputs: vec![],
+            });
+        }
+
+        let max_par = scheduler_config.max_parallelism.max(1);
+
+        // Build in-degree map and reverse dependency map (owned NodeIds).
+        let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
+        let mut reverse_deps: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+
+        for node in &self.execution_order {
+            in_degree.entry(node.clone()).or_insert(0);
+            if let Some(node_deps) = self.deps.get(node) {
+                *in_degree.entry(node.clone()).or_insert(0) = node_deps.len();
+                for dep in node_deps {
+                    reverse_deps
+                        .entry(dep.clone())
+                        .or_default()
+                        .push(node.clone());
+                }
+            }
+        }
+
+        // Ready queue: nodes with in-degree 0.
+        let mut ready: VecDeque<NodeId> = VecDeque::new();
+        for node in &self.execution_order {
+            if in_degree[node] == 0 {
+                ready.push_back(node.clone());
+            }
+        }
+
+        let probe_outputs: Arc<tokio::sync::Mutex<HashMap<ProbeId, ProbeOutput>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let check_outputs: Arc<tokio::sync::Mutex<Vec<(String, CheckOutput)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let semaphore = Arc::new(Semaphore::new(max_par));
+
+        let mut completed_count = 0;
+        let total = self.execution_order.len();
+
+        // JoinSet owns spawned tasks; dropping it cancels in-flight work.
+        let mut in_flight: JoinSet<Result<NodeId, RunError>> = JoinSet::new();
+
+        loop {
+            // Dispatch all currently-ready nodes.
+            while let Some(node) = ready.pop_front() {
+                let sem = Arc::clone(&semaphore);
+                let probe_out = Arc::clone(&probe_outputs);
+                let check_out = Arc::clone(&check_outputs);
+                let pr = project_root.clone();
+                let cfg = config.clone();
+
+                match node {
+                    NodeId::Probe(ref name) => {
+                        let probe = Arc::clone(
+                            self.probes.get(name).expect("validated in build"),
+                        );
+                        let dep_names: Vec<String> =
+                            probe.manifest().dependencies.clone();
+                        let node_id = node.clone();
+                        let name = name.clone();
+
+                        in_flight.spawn(async move {
+                            let _permit = sem
+                                .acquire()
+                                .await
+                                .expect("semaphore should not be closed");
+
+                            let dep_outputs = {
+                                let outputs = probe_out.lock().await;
+                                dep_names
+                                    .iter()
+                                    .filter_map(|dep_name| {
+                                        let id = ProbeId(dep_name.clone());
+                                        outputs.get(&id).map(|out| (id, out.clone()))
+                                    })
+                                    .collect()
+                            };
+
+                            let ctx = ProbeContext::new(pr, cfg, dep_outputs);
+                            let output =
+                                probe.run_dyn(&ctx).await.map_err(|source| {
+                                    RunError::ProbeFailed {
+                                        name: name.clone(),
+                                        source,
+                                    }
+                                })?;
+
+                            probe_out
+                                .lock()
+                                .await
+                                .insert(ProbeId(name), output);
+
+                            Ok(node_id)
+                        });
+                    }
+                    NodeId::Check(ref name) => {
+                        let check = Arc::clone(
+                            self.checks.get(name).expect("validated in build"),
+                        );
+                        let dep_names: Vec<String> =
+                            check.manifest().dependencies.clone();
+                        let node_id = node.clone();
+                        let name = name.clone();
+
+                        in_flight.spawn(async move {
+                            let _permit = sem
+                                .acquire()
+                                .await
+                                .expect("semaphore should not be closed");
+
+                            let check_probe_outputs = {
+                                let outputs = probe_out.lock().await;
+                                dep_names
+                                    .iter()
+                                    .filter_map(|dep_name| {
+                                        let id = ProbeId(dep_name.clone());
+                                        outputs.get(&id).map(|out| (id, out.clone()))
+                                    })
+                                    .collect()
+                            };
+
+                            let ctx =
+                                CheckContext::new(pr, cfg, check_probe_outputs);
+                            let output =
+                                check.run_dyn(&ctx).await.map_err(|source| {
+                                    RunError::CheckFailed {
+                                        name: name.clone(),
+                                        source,
+                                    }
+                                })?;
+
+                            check_out.lock().await.push((name, output));
+
+                            Ok(node_id)
+                        });
+                    }
+                }
+            }
+
+            if completed_count == total {
+                break;
+            }
+
+            // Wait for the next task to complete.
+            let join_result = in_flight
+                .join_next()
+                .await
+                .expect("in_flight should not be empty when completed < total");
+
+            // Unwrap JoinError (panic in task) then the RunError.
+            let finished_node = join_result
+                .expect("spawned task should not panic")?;
+            completed_count += 1;
+
+            // Decrement in-degree for dependents of the finished node.
+            if let Some(dependents) = reverse_deps.get(&finished_node) {
+                for dependent in dependents {
+                    let deg = in_degree.get_mut(dependent).expect("node in graph");
+                    *deg -= 1;
+                    if *deg == 0 {
+                        ready.push_back(dependent.clone());
+                    }
+                }
+            }
+        }
+
+        let check_outputs = Arc::try_unwrap(check_outputs)
+            .expect("all tasks completed")
+            .into_inner();
+
+        Ok(RunResult { check_outputs })
     }
 
     /// Execute all nodes sequentially in topological order.
@@ -443,6 +664,9 @@ fn visit(
 mod tests {
     use super::*;
     use qualitool_protocol::finding::{Finding, FindingId, Severity};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     // -- Test helpers -------------------------------------------------------
 
@@ -1069,5 +1293,331 @@ mod tests {
             }
             _ => panic!("expected Findings"),
         }
+    }
+
+    // -- Parallel execution tests -------------------------------------------
+
+    /// A probe that sleeps for a fixed duration and tracks concurrency.
+    struct SlowProbe {
+        manifest: ProbeManifest,
+        output: serde_json::Value,
+        delay: Duration,
+        tracker: Arc<ConcurrencyTracker>,
+    }
+
+    /// Tracks the maximum number of concurrently-executing nodes.
+    struct ConcurrencyTracker {
+        current: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl ConcurrencyTracker {
+        fn new() -> Self {
+            Self {
+                current: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+
+        fn enter(&self) {
+            let prev = self.current.fetch_add(1, Ordering::SeqCst);
+            let new = prev + 1;
+            self.peak.fetch_max(new, Ordering::SeqCst);
+        }
+
+        fn exit(&self) {
+            self.current.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SlowProbe {
+        fn new(
+            name: &str,
+            deps: &[&str],
+            output: serde_json::Value,
+            delay: Duration,
+            tracker: Arc<ConcurrencyTracker>,
+        ) -> Self {
+            Self {
+                manifest: ProbeManifest {
+                    name: name.into(),
+                    version: "0.1.0".into(),
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    dependencies: deps.iter().map(|&s| s.into()).collect(),
+                    contains_source_code: false,
+                },
+                output,
+                delay,
+                tracker,
+            }
+        }
+    }
+
+    impl Probe for SlowProbe {
+        fn manifest(&self) -> &ProbeManifest {
+            &self.manifest
+        }
+
+        async fn run(&self, _ctx: &ProbeContext) -> Result<ProbeOutput, ProbeError> {
+            self.tracker.enter();
+            tokio::time::sleep(self.delay).await;
+            self.tracker.exit();
+            Ok(ProbeOutput(self.output.clone()))
+        }
+    }
+
+    /// A check that sleeps for a fixed duration and tracks concurrency.
+    struct SlowCheck {
+        manifest: CheckManifest,
+        delay: Duration,
+        tracker: Arc<ConcurrencyTracker>,
+    }
+
+    impl SlowCheck {
+        fn new(
+            name: &str,
+            deps: &[&str],
+            delay: Duration,
+            tracker: Arc<ConcurrencyTracker>,
+        ) -> Self {
+            Self {
+                manifest: CheckManifest {
+                    name: name.into(),
+                    version: "0.1.0".into(),
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    dependencies: deps.iter().map(|&s| s.into()).collect(),
+                },
+                delay,
+                tracker,
+            }
+        }
+    }
+
+    impl Check for SlowCheck {
+        fn manifest(&self) -> &CheckManifest {
+            &self.manifest
+        }
+
+        async fn run(&self, _ctx: &CheckContext) -> Result<CheckOutput, CheckError> {
+            self.tracker.enter();
+            tokio::time::sleep(self.delay).await;
+            self.tracker.exit();
+            Ok(CheckOutput::Findings { findings: vec![] })
+        }
+    }
+
+    #[test]
+    fn scheduler_config_default_max_parallelism() {
+        let config = SchedulerConfig::default();
+        // Default should be at least 1
+        assert!(config.max_parallelism >= 1);
+    }
+
+    #[test]
+    fn scheduler_config_custom_max_parallelism() {
+        let config = SchedulerConfig { max_parallelism: 4 };
+        assert_eq!(config.max_parallelism, 4);
+    }
+
+    #[tokio::test]
+    async fn parallel_run_honors_max_parallelism() {
+        // 4 independent probes each sleeping 50ms, max_parallelism=2.
+        // Peak concurrency must not exceed 2.
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(50);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(SlowProbe::new("p1", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p2", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p3", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p4", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 2 };
+        scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert!(tracker.peak() <= 2, "peak concurrency {} exceeded max_parallelism 2", tracker.peak());
+        assert!(tracker.peak() >= 2, "expected peak concurrency of 2, got {}", tracker.peak());
+    }
+
+    #[tokio::test]
+    async fn parallel_run_with_max_parallelism_1_is_sequential() {
+        // With max_parallelism=1, peak concurrency must be exactly 1.
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(30);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(SlowProbe::new("p1", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p2", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p3", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 1 };
+        scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        assert_eq!(tracker.peak(), 1, "with max_parallelism=1, peak must be 1");
+    }
+
+    #[tokio::test]
+    async fn parallel_run_respects_dependencies() {
+        // p-root → p-child (dependency), both with delays.
+        // p-child must not start until p-root completes.
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(50);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(SlowProbe::new("p-root", &[], serde_json::json!({"value": 10}), delay, Arc::clone(&tracker)))
+            .add_probe(DependentProbe::new("p-child", "p-root"))
+            .add_check(VerifyingCheck::new("c1", "p-child"))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        // p-child should have doubled p-root's value
+        match &result.check_outputs[0].1 {
+            CheckOutput::Findings { findings } => {
+                assert_eq!(findings[0].payload["value"], 20);
+            }
+            _ => panic!("expected Findings"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_run_shared_probe_cache_concurrent_reads() {
+        // One probe, three checks all reading from it concurrently.
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(50);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("shared", &[], serde_json::json!({"value": 99})))
+            .add_check(SlowCheck::new("c1", &["shared"], delay, Arc::clone(&tracker)))
+            .add_check(SlowCheck::new("c2", &["shared"], delay, Arc::clone(&tracker)))
+            .add_check(SlowCheck::new("c3", &["shared"], delay, Arc::clone(&tracker)))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 3 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+
+        // All three checks should complete successfully
+        assert_eq!(result.check_outputs.len(), 3);
+        // Checks ran in parallel (peak should be >=2)
+        assert!(tracker.peak() >= 2, "expected concurrent check execution, peak was {}", tracker.peak());
+    }
+
+    #[tokio::test]
+    async fn parallel_run_speedup_over_sequential() {
+        // 4 independent probes each sleeping 50ms.
+        // Sequential: ~200ms. Parallel (max=4): ~50ms.
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(50);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(SlowProbe::new("p1", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p2", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p3", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p4", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let start = Instant::now();
+        scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+        let parallel_elapsed = start.elapsed();
+
+        // Parallel should take significantly less than 4 * 50ms = 200ms.
+        // Allow generous margin but ensure it's faster than sequential.
+        assert!(
+            parallel_elapsed < Duration::from_millis(150),
+            "parallel execution took {:?}, expected under 150ms",
+            parallel_elapsed,
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_run_probe_failure_stops_execution() {
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(30);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(FailingProbe::new("bad"))
+            .add_probe(SlowProbe::new("good", &[], serde_json::json!({}), delay, Arc::clone(&tracker)))
+            .add_check(TestCheck::new("c1", &["good"]))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let err = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap_err();
+
+        match err {
+            RunError::ProbeFailed { name, .. } => assert_eq!(name, "bad"),
+            other => panic!("expected ProbeFailed, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_run_check_failure_stops_execution() {
+        let scheduler = Scheduler::builder()
+            .add_probe(TestProbe::new("p1", &[], serde_json::json!({})))
+            .add_check(FailingCheck::new("bad"))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let err = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap_err();
+
+        match err {
+            RunError::CheckFailed { name, .. } => assert_eq!(name, "bad"),
+            other => panic!("expected CheckFailed, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_run_empty_scheduler() {
+        let scheduler = Scheduler::builder().build().unwrap();
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+        assert!(result.check_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_run_diamond_dag() {
+        // Diamond:  p-root → p-left, p-root → p-right, both → c-merge
+        let tracker = Arc::new(ConcurrencyTracker::new());
+        let delay = Duration::from_millis(50);
+
+        let scheduler = Scheduler::builder()
+            .add_probe(SlowProbe::new("p-root", &[], serde_json::json!({"value": 5}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p-left", &["p-root"], serde_json::json!({"value": 10}), delay, Arc::clone(&tracker)))
+            .add_probe(SlowProbe::new("p-right", &["p-root"], serde_json::json!({"value": 20}), delay, Arc::clone(&tracker)))
+            .add_check(TestCheck::new("c-merge", &["p-left", "p-right"]))
+            .build()
+            .unwrap();
+
+        let config = SchedulerConfig { max_parallelism: 4 };
+        let start = Instant::now();
+        let result = scheduler.run_parallel(project_root(), empty_config(), &config).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.check_outputs.len(), 1);
+        // p-left and p-right should run in parallel after p-root.
+        // Total: ~100ms (50ms for root + 50ms for parallel left/right), not 150ms.
+        assert!(
+            elapsed < Duration::from_millis(130),
+            "diamond DAG took {:?}, expected under 130ms (parallel branches)",
+            elapsed,
+        );
     }
 }
